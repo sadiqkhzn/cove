@@ -32,7 +32,7 @@ Claude Code hooks → `cove hook {event}` → writes JSONL to `~/.cove/events/{s
 - **`commands/start.rs`** — entry point for creating sessions. Checks/prompts for hook installation, handles first-run vs. adding a window to an existing session.
 - **`commands/init.rs`** — manages Claude Code hooks in `~/.claude/settings.json`. Installs 4 async hooks (UserPromptSubmit, Stop, PreToolUse, PostToolUse) that call `cove hook`.
 - **`commands/hook.rs`** — hook handler. Reads JSON from stdin, maps event type to state string, appends JSONL event with `pane_id` from `$TMUX_PANE`.
-- **`sidebar/state.rs`** — state detection. Reads last line of each `.jsonl` file, matches events to windows by `pane_id`. States: Fresh → Working → Asking → Idle → Done.
+- **`sidebar/state.rs`** — state detection. Reads last line of each `.jsonl` file, matches events to windows by `pane_id`. States: Fresh → Working → Asking → Waiting → Idle → Done.
 - **`sidebar/app.rs`** — ratatui event loop. Renders in-place (no alternate screen) inside a tmux pane.
 - **`sidebar/ui.rs`** — ratatui widgets. Session list with status indicators (animated spinner for Working, static labels for other states).
 - **`colors.rs`** — Catppuccin Mocha palette. Defines both ratatui `Color` constants and `ANSI_*` escape codes for CLI output.
