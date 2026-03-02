@@ -37,6 +37,14 @@ Claude Code hooks → `cove hook {event}` → writes JSONL to `~/.cove/events/{s
 - **`sidebar/ui.rs`** — ratatui widgets. Session list with status indicators (animated spinner for Working, static labels for other states).
 - **`colors.rs`** — Catppuccin Mocha palette. Defines both ratatui `Color` constants and `ANSI_*` escape codes for CLI output.
 
+## Releasing
+
+The release pipeline is fully automated **once the version is bumped**. The chain: version in `Cargo.toml` → `auto-tag.yml` creates git tag → `release.yml` builds platform binaries + homebrew → `publish.yml` pushes to crates.io.
+
+**Every stack that changes behavior (features, fixes, refactors) must include a version bump.** Make the `Cargo.toml` version bump the last diff in the stack so it merges together with the code change. Do not submit stacks without a version bump — the release pipeline will silently skip them.
+
+Patch bumps (0.3.3 → 0.3.4) for fixes, minor bumps (0.3 → 0.4) for new features.
+
 ## Pre-coding context gate
 
 Before writing any Rust code for a new module or significant piece of work, **stop and ask the user for context first**. The prompt should be:
