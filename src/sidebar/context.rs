@@ -9,11 +9,17 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use std::{io, thread};
 
+use crate::sidebar::state::WindowState;
+use crate::tmux::WindowInfo;
+
 // ── Types ──
+
+type GeneratorFn = Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>;
 
 pub struct ContextManager {
     contexts: HashMap<String, String>,
@@ -21,6 +27,8 @@ pub struct ContextManager {
     failed: HashMap<String, Instant>,
     tx: mpsc::Sender<(String, String)>,
     rx: mpsc::Receiver<(String, String)>,
+    generator: GeneratorFn,
+    prev_selected_name: Option<String>,
 }
 
 // ── Constants ──
@@ -50,6 +58,24 @@ impl ContextManager {
             failed: HashMap::new(),
             tx,
             rx,
+            generator: Arc::new(generate_context),
+            prev_selected_name: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_generator(
+        generator_fn: impl Fn(&str, &str) -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self {
+            contexts: HashMap::new(),
+            in_flight: HashSet::new(),
+            failed: HashMap::new(),
+            tx,
+            rx,
+            generator: Arc::new(generator_fn),
+            prev_selected_name: None,
         }
     }
 
@@ -73,6 +99,64 @@ impl ContextManager {
     /// Whether a context request is currently running for this window.
     pub fn is_loading(&self, name: &str) -> bool {
         self.in_flight.contains(name)
+    }
+
+    /// Run one tick of context orchestration.
+    ///
+    /// - Prefetches context for all non-Fresh sessions
+    /// - Drains completed results from background threads
+    /// - On selection change: refreshes old session (if active), requests new session (if active)
+    pub fn tick(
+        &mut self,
+        windows: &[WindowInfo],
+        states: &HashMap<u32, WindowState>,
+        selected: usize,
+        pane_id_for: &impl Fn(u32) -> Option<String>,
+    ) {
+        // Prefetch context for all non-fresh sessions
+        for win in windows {
+            let state = states
+                .get(&win.index)
+                .copied()
+                .unwrap_or(WindowState::Fresh);
+            if state != WindowState::Fresh {
+                let pane_id = pane_id_for(win.index).unwrap_or_default();
+                self.request(&win.name, &win.pane_path, &pane_id);
+            }
+        }
+
+        // Drain completed context results from background threads
+        self.drain();
+
+        // Track selection changes and manage context generation
+        let current_name = windows.get(selected).map(|w| w.name.clone());
+        if current_name != self.prev_selected_name {
+            // Refresh context for old session — only if it had activity (not Fresh)
+            if let Some(ref prev_name) = self.prev_selected_name {
+                if let Some(prev_win) = windows.iter().find(|w| w.name == *prev_name) {
+                    let state = states
+                        .get(&prev_win.index)
+                        .copied()
+                        .unwrap_or(WindowState::Fresh);
+                    if state != WindowState::Fresh {
+                        let pane_id = pane_id_for(prev_win.index).unwrap_or_default();
+                        self.refresh(&prev_win.name, &prev_win.pane_path, &pane_id);
+                    }
+                }
+            }
+            // Request context for new session — only if it had activity (not Fresh)
+            if let Some(win) = windows.get(selected) {
+                let state = states
+                    .get(&win.index)
+                    .copied()
+                    .unwrap_or(WindowState::Fresh);
+                if state != WindowState::Fresh {
+                    let pane_id = pane_id_for(win.index).unwrap_or_default();
+                    self.request(&win.name, &win.pane_path, &pane_id);
+                }
+            }
+            self.prev_selected_name = current_name;
+        }
     }
 
     /// Request context generation for a window (no-op if cached, in flight, or within retry cooldown).
@@ -105,8 +189,9 @@ impl ContextManager {
         let name = name.to_string();
         let cwd = cwd.to_string();
         let pane_id = pane_id.to_string();
+        let generator = Arc::clone(&self.generator);
         thread::spawn(move || {
-            let context = generate_context(&cwd, &pane_id).unwrap_or_default();
+            let context = generator(&cwd, &pane_id).unwrap_or_default();
             let _ = tx.send((name, context));
         });
     }
@@ -426,5 +511,219 @@ mod tests {
             .unwrap();
         let event: serde_json::Value = serde_json::from_str(last_line).unwrap();
         assert_eq!(event.get("pane_id").and_then(|v| v.as_str()), Some("%5"));
+    }
+
+    // ── Context lifecycle integration tests ──
+    //
+    // These test the orchestration logic in tick(): when context generation
+    // fires (or doesn't) based on session state and selection changes.
+
+    use std::sync::Mutex;
+
+    /// Build a mock generator that tracks calls and returns controlled results.
+    fn mock_generator() -> (
+        impl Fn(&str, &str) -> Option<String> + Send + Sync + 'static,
+        Arc<Mutex<Vec<(String, String)>>>,
+    ) {
+        let calls: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = Arc::clone(&calls);
+        let generator = move |cwd: &str, pane_id: &str| -> Option<String> {
+            calls_clone
+                .lock()
+                .unwrap()
+                .push((cwd.to_string(), pane_id.to_string()));
+            Some(format!("context for {pane_id}"))
+        };
+        (generator, calls)
+    }
+
+    fn win(index: u32, name: &str) -> WindowInfo {
+        WindowInfo {
+            index,
+            name: name.to_string(),
+            is_active: false,
+            pane_path: format!("/project/{name}"),
+        }
+    }
+
+    fn pane_ids(map: &HashMap<u32, String>) -> impl Fn(u32) -> Option<String> + '_ {
+        move |idx| map.get(&idx).cloned()
+    }
+
+    /// Drain results by waiting briefly for background threads to complete.
+    fn drain_with_wait(mgr: &mut ContextManager) {
+        // Background threads are fast (mock generator returns immediately),
+        // but we need a brief pause for the thread to send its result.
+        thread::sleep(Duration::from_millis(50));
+        mgr.drain();
+    }
+
+    // ── Scenario 1: New session → no context action ──
+    //
+    // A brand-new session (Fresh state) should not trigger any context
+    // generation. No "loading…", no failed generation.
+    #[test]
+    fn test_new_session_no_context_action() {
+        let (generator, calls) = mock_generator();
+        let mut mgr = ContextManager::with_generator(generator);
+
+        let windows = vec![win(1, "session-1")];
+        let states: HashMap<u32, WindowState> = [(1, WindowState::Fresh)].into_iter().collect();
+        let panes: HashMap<u32, String> = [(1, "%0".into())].into_iter().collect();
+
+        // Run a tick with the Fresh session selected
+        mgr.tick(&windows, &states, 0, &pane_ids(&panes));
+
+        // No generation should have been spawned
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(!mgr.is_loading("session-1"));
+        assert!(mgr.get("session-1").is_none());
+    }
+
+    // ── Scenario 2: Switch from new (no prompt) session to another new session → no context action ──
+    //
+    // Both sessions are Fresh. Switching between them should not trigger
+    // context generation for either session.
+    #[test]
+    fn test_switch_between_fresh_sessions_no_context_action() {
+        let (generator, calls) = mock_generator();
+        let mut mgr = ContextManager::with_generator(generator);
+
+        let windows = vec![win(1, "session-1"), win(2, "session-2")];
+        let states: HashMap<u32, WindowState> = [(1, WindowState::Fresh), (2, WindowState::Fresh)]
+            .into_iter()
+            .collect();
+        let panes: HashMap<u32, String> =
+            [(1, "%0".into()), (2, "%1".into())].into_iter().collect();
+
+        // Tick 1: session-1 selected (Fresh)
+        mgr.tick(&windows, &states, 0, &pane_ids(&panes));
+        assert!(calls.lock().unwrap().is_empty());
+
+        // Tick 2: switch to session-2 (also Fresh)
+        mgr.tick(&windows, &states, 1, &pane_ids(&panes));
+
+        // No generation for either session
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(!mgr.is_loading("session-1"));
+        assert!(!mgr.is_loading("session-2"));
+        assert!(mgr.get("session-1").is_none());
+        assert!(mgr.get("session-2").is_none());
+    }
+
+    // ── Scenario 3: Switch from active session to new session → fire context for previous ──
+    //
+    // When switching away from a session that has had at least 1 conversation
+    // turn (not Fresh), context generation should fire for that session.
+    // The new Fresh session should NOT get context generated.
+    #[test]
+    fn test_switch_from_active_to_fresh_fires_context_for_previous() {
+        let (generator, calls) = mock_generator();
+        let mut mgr = ContextManager::with_generator(generator);
+
+        let windows = vec![win(1, "active-session"), win(2, "new-session")];
+        let states: HashMap<u32, WindowState> = [(1, WindowState::Idle), (2, WindowState::Fresh)]
+            .into_iter()
+            .collect();
+        let panes: HashMap<u32, String> =
+            [(1, "%0".into()), (2, "%1".into())].into_iter().collect();
+
+        // Tick 1: active-session selected (Idle — has had activity)
+        mgr.tick(&windows, &states, 0, &pane_ids(&panes));
+        drain_with_wait(&mut mgr);
+
+        // The prefetch loop should have requested context for the active session
+        let call_count_after_tick1 = calls.lock().unwrap().len();
+        assert!(
+            call_count_after_tick1 > 0,
+            "should request context for Idle session"
+        );
+        assert!(
+            calls.lock().unwrap().iter().any(|(_, pid)| pid == "%0"),
+            "should request for pane %0"
+        );
+
+        // Tick 2: switch to new-session (Fresh)
+        calls.lock().unwrap().clear();
+        mgr.tick(&windows, &states, 1, &pane_ids(&panes));
+        // Wait for background thread to complete so calls are recorded
+        drain_with_wait(&mut mgr);
+
+        // Should fire refresh for old active-session (pane %0)
+        // Should NOT fire for new-session (pane %1) since it's Fresh
+        let tick2_calls = calls.lock().unwrap().clone();
+        assert!(
+            tick2_calls.iter().any(|(_, pid)| pid == "%0"),
+            "should refresh context for previous active session"
+        );
+        assert!(
+            !tick2_calls.iter().any(|(_, pid)| pid == "%1"),
+            "should NOT request context for Fresh new session"
+        );
+
+        // new-session should have no loading state or context
+        assert!(!mgr.is_loading("new-session"));
+        assert!(mgr.get("new-session").is_none());
+    }
+
+    // ── Scenario 4: Switch back to previous session while context is pending → loading state ──
+    //
+    // After switching away from an active session (triggering refresh),
+    // switching back before the generation completes should show loading state.
+    #[test]
+    fn test_switch_back_while_pending_shows_loading() {
+        // Use a slow generator that blocks until signaled
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let barrier_clone = Arc::clone(&barrier);
+        let slow_generator = move |_cwd: &str, _pane_id: &str| -> Option<String> {
+            barrier_clone.wait();
+            Some("generated context".to_string())
+        };
+        let mut mgr = ContextManager::with_generator(slow_generator);
+
+        let windows = vec![win(1, "active-session"), win(2, "new-session")];
+        let states: HashMap<u32, WindowState> = [(1, WindowState::Idle), (2, WindowState::Fresh)]
+            .into_iter()
+            .collect();
+        let panes: HashMap<u32, String> =
+            [(1, "%0".into()), (2, "%1".into())].into_iter().collect();
+
+        // Tick 1: active-session selected — starts context generation (blocked on barrier)
+        mgr.tick(&windows, &states, 0, &pane_ids(&panes));
+        // Context is in-flight but blocked, so is_loading should be true
+        assert!(
+            mgr.is_loading("active-session"),
+            "should be loading while generator is running"
+        );
+
+        // Tick 2: switch to new-session — triggers refresh for active-session
+        // But active-session is still in-flight (blocked), so refresh is a no-op
+        mgr.tick(&windows, &states, 1, &pane_ids(&panes));
+
+        // Tick 3: switch back to active-session — should still show loading
+        mgr.tick(&windows, &states, 0, &pane_ids(&panes));
+        assert!(
+            mgr.is_loading("active-session"),
+            "should still be loading when switching back"
+        );
+        assert!(
+            mgr.get("active-session").is_none(),
+            "context should not be available yet"
+        );
+
+        // Unblock the generator
+        barrier.wait();
+        drain_with_wait(&mut mgr);
+
+        // Now context should be available
+        assert!(
+            !mgr.is_loading("active-session"),
+            "should not be loading after drain"
+        );
+        assert_eq!(
+            mgr.get("active-session"),
+            Some("generated context"),
+            "context should be populated after drain"
+        );
     }
 }
